@@ -385,6 +385,13 @@ impl WorkerQueryClient {
             if let Err(error) = self.target.remove_worker(worker_id).await {
                 tracing::warn!(worker_id, %error, "Failed to remove worker from recovery target");
             }
+        } else if let Err(error) = self.target.remove_rank(worker_id, dp_rank).await {
+            tracing::warn!(
+                worker_id,
+                dp_rank,
+                %error,
+                "Failed to remove rank from recovery target"
+            );
         }
     }
 
@@ -2182,6 +2189,30 @@ mod tests {
         }));
 
         release.notify_waiters();
+    }
+
+    #[tokio::test]
+    async fn test_nonfinal_rank_removal_clears_only_departing_rank() {
+        let (client, _transport, kv_indexer) = make_test_client("remove-nonfinal-rank").await;
+
+        kv_indexer.apply_event(make_store_event(1, 0, 10)).await;
+        kv_indexer.apply_event(make_store_event(1, 1, 20)).await;
+        kv_indexer.flush().await;
+        {
+            let worker_state = client.get_or_create_worker_state(1);
+            let mut worker_state = worker_state.lock().await;
+            worker_state.ranks.entry(0).or_default().cursor = CursorState::Live(10);
+            worker_state.ranks.entry(1).or_default().cursor = CursorState::Live(20);
+        }
+
+        client.handle_removed_worker_dp(1, 0).await;
+
+        assert!(!rank_state_matches(&client, (1, 0), |_| true));
+        assert!(rank_state_matches(&client, (1, 1), |_| true));
+        kv_indexer.flush().await;
+        let events = kv_indexer.dump_events().await.unwrap();
+        assert!(stored_block_hashes_for(&events, 1, 0).is_empty());
+        assert_eq!(stored_block_hashes_for(&events, 1, 1), vec![20]);
     }
 
     #[tokio::test]
